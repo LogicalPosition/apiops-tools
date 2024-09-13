@@ -20,6 +20,50 @@ using System.Threading.Tasks;
 
 namespace common;
 
+public class AzureManagementRequestException(
+    string message,
+    HttpStatusCode statusCode,
+    string errorCode,
+    Uri requestUri,
+    Exception? innerException)
+    : HttpRequestException(message, innerException, statusCode)
+{
+    private const string AzureManagementRequestHost = "management.azure.com";
+
+    private const string MethodNotAllowedInPricingTierErrorCode = "MethodNotAllowedInPricingTier";
+
+    public string ErrorCode { get; } = errorCode;
+
+    public Uri RequestUri { get; } = requestUri;
+
+    public static AzureManagementRequestException FromResponse(Response response, Uri requestUri)
+    {
+        if (requestUri is not { Host: AzureManagementRequestHost })
+        {
+            throw new ArgumentException($"The request URI host must be '{AzureManagementRequestHost}'.", nameof(requestUri));
+        }
+
+        var errorCode = response.TryGetErrorCode()
+                               .IfNone("Unknown");
+
+        var status = (HttpStatusCode)response.Status;
+
+        return new AzureManagementRequestException(
+            message: $"The Azure Management request to URI {requestUri} failed with status code {status}. Content is '{response.Content}'.",
+            statusCode: status,
+            errorCode: errorCode,
+            requestUri: requestUri,
+            innerException: null);
+
+    }
+
+    public static bool IsAzureManagementRequest(Uri uri) =>
+        uri is { Host: AzureManagementRequestHost };
+
+    public bool IsMethodNotAllowedInPricingTierError =>
+        ErrorCode.Equals(MethodNotAllowedInPricingTierErrorCode, StringComparison.OrdinalIgnoreCase);
+}
+
 public static class HttpPipelineExtensions
 {
     public static async ValueTask<BinaryData> GetContent(this HttpPipeline pipeline, Uri uri, CancellationToken cancellationToken)
@@ -66,17 +110,53 @@ public static class HttpPipelineExtensions
         }
     }
 
-    public static HttpRequestException ToHttpRequestException(this Response response, Uri requestUri) =>
-        new(message: $"HTTP request to URI {requestUri} failed with status code {response.Status}. Content is '{response.Content}'.", inner: null, statusCode: (HttpStatusCode)response.Status);
+    public static HttpRequestException ToHttpRequestException(this Response response, Uri requestUri)
+    {
+        return AzureManagementRequestException.IsAzureManagementRequest(requestUri) ?
+            AzureManagementRequestException.FromResponse(response, requestUri) :
+            new HttpRequestException(message: $"HTTP request to URI {requestUri} failed with status code {response.Status}. Content is '{response.Content}'.", inner: null, statusCode: (HttpStatusCode)response.Status);
+    }
 
-    private static T IfLeftThrow<T>(this Either<Response, T> either, Uri requestUri) =>
-        either.IfLeft(response =>
+    public static Option<string> TryGetErrorCode(this Response response)
+    {
+        try
+        {
+            return response.Content
+                .ToObjectFromJson<JsonObject>()
+                .TryGetJsonObjectProperty("error")
+                .Bind(error => error.TryGetStringProperty("code"))
+                .ToOption();
+        }
+        catch (Exception exception) when (exception is ArgumentNullException or NotSupportedException or JsonException)
+        {
+            return Option<string>.None;
+        }
+    }
+
+    public static bool HasSpecificError(this Response response, string errorCode)
+    {
+        try
+        {
+            return response.IsError && response.TryGetErrorCode()
+                           .Where(code => code.Equals(errorCode, StringComparison.OrdinalIgnoreCase))
+                           .IsSome;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    private static T IfLeftThrow<T>(this Either<Response, T> either, Uri requestUri)
+    {
+        return either.IfLeft(response =>
         {
             using (response)
             {
                 throw response.ToHttpRequestException(requestUri);
             }
         });
+    }
 
     public static async IAsyncEnumerable<JsonObject> ListJsonObjects(this HttpPipeline pipeline, Uri uri, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
@@ -84,7 +164,16 @@ public static class HttpPipelineExtensions
 
         while (nextLink is not null)
         {
-            var responseJson = await pipeline.GetJsonObject(nextLink, cancellationToken);
+            JsonObject responseJson;
+            try
+            {
+                responseJson = await pipeline.GetJsonObject(nextLink, cancellationToken);
+            }
+            catch (AzureManagementRequestException exception) when (exception.IsMethodNotAllowedInPricingTierError)
+            {
+                nextLink = null;
+                break;
+            }
 
             var values = responseJson.TryGetJsonArrayProperty("value")
                                      .IfLeft(() => [])
@@ -128,7 +217,14 @@ public static class HttpPipelineExtensions
     {
         var either = await pipeline.TryDeleteResource(uri, waitForCompletion, cancellationToken);
 
-        either.IfLeftThrow(uri);
+        try
+        {
+            either.IfLeftThrow(uri);
+        }
+        catch (AzureManagementRequestException exception) when (!exception.IsMethodNotAllowedInPricingTierError)
+        {
+            throw;
+        }
     }
 
     public static async ValueTask<Either<Response, Unit>> TryDeleteResource(this HttpPipeline pipeline, Uri uri, bool waitForCompletion, CancellationToken cancellationToken)
@@ -169,9 +265,14 @@ public static class HttpPipelineExtensions
     {
         var either = await pipeline.TryPutContent(uri, content, cancellationToken);
 
-#pragma warning disable CA1806 // Do not ignore method results
-        either.IfLeft(response => throw response.ToHttpRequestException(uri));
-#pragma warning restore CA1806 // Do not ignore method results
+        try
+        {
+            either.IfLeftThrow(uri);
+        }
+        catch (AzureManagementRequestException exception) when (!exception.IsMethodNotAllowedInPricingTierError)
+        {
+            throw;
+        }
     }
 
     public static async ValueTask<Either<Response, Unit>> TryPutContent(this HttpPipeline pipeline, Uri uri, BinaryData content, CancellationToken cancellationToken)
@@ -207,9 +308,14 @@ public static class HttpPipelineExtensions
     {
         var either = await pipeline.TryPatchContent(uri, content, cancellationToken);
 
-#pragma warning disable CA1806 // Do not ignore method results
-        either.IfLeft(response => throw response.ToHttpRequestException(uri));
-#pragma warning restore CA1806 // Do not ignore method results
+        try
+        {
+            either.IfLeftThrow(uri);
+        }
+        catch (AzureManagementRequestException exception) when (!exception.IsMethodNotAllowedInPricingTierError)
+        {
+            throw;
+        }
     }
 
     public static async ValueTask<Either<Response, Unit>> TryPatchContent(this HttpPipeline pipeline, Uri uri, BinaryData content, CancellationToken cancellationToken)
@@ -308,7 +414,9 @@ public sealed class ILoggerHttpPipelinePolicy(ILogger logger) : HttpPipelinePoli
         }
 
         var startTime = Stopwatch.GetTimestamp();
+
         await ProcessNextAsync(message, pipeline);
+
         var endTime = Stopwatch.GetTimestamp();
         var duration = TimeSpan.FromSeconds((endTime - startTime) / (double)Stopwatch.Frequency);
 
@@ -318,7 +426,7 @@ public sealed class ILoggerHttpPipelinePolicy(ILogger logger) : HttpPipelinePoli
                             Received response
                             Method: {HttpMethod}
                             Uri: {Uri}
-                            Status code: {StatusCode}
+                            Status code: {HttpStatusCode}
                             Duration (hh:mm:ss): {Duration}
                             Content: {ResponseContent}
                             """, message.Request.Method, message.Request.Uri, message.Response.Status, duration.ToString("c"), GetResponseContent(message));
@@ -329,7 +437,7 @@ public sealed class ILoggerHttpPipelinePolicy(ILogger logger) : HttpPipelinePoli
                             Received response
                             Method: {HttpMethod}
                             Uri: {Uri}
-                            Status code: {StatusCode}
+                            Status code: {HttpStatusCode}
                             Duration (hh:mm:ss): {Duration}
                             """, message.Request.Method, message.Request.Uri, message.Response.Status, duration.ToString("c"));
         }
@@ -396,25 +504,7 @@ public class CommonRetryPolicy : RetryPolicy
     }
 
     private static bool HasManagementApiRequestFailedError(Response response) =>
-        TryGetErrorCode(response)
-            .Where(code => code.Equals("ManagementApiRequestFailed", StringComparison.OrdinalIgnoreCase))
-            .IsSome;
-
-    private static Option<string> TryGetErrorCode(Response response)
-    {
-        try
-        {
-            return response.Content
-                           .ToObjectFromJson<JsonObject>()
-                           .TryGetJsonObjectProperty("error")
-                           .Bind(error => error.TryGetStringProperty("code"))
-                           .ToOption();
-        }
-        catch (Exception exception) when (exception is ArgumentNullException or NotSupportedException or JsonException)
-        {
-            return Option<string>.None;
-        }
-    }
+        response.HasSpecificError("ManagementApiRequestFailed");
 }
 
 public class TelemetryPolicy(Version version) : HttpPipelinePolicy
