@@ -366,7 +366,7 @@ internal static class ApiModule
 
         return async (name, dto, cancellationToken) =>
         {
-            if (ApiName.IsRevisioned(name))
+            if (ApiName.IsNotRevisioned(name))
             {
                 return;
             }
