@@ -32,6 +32,8 @@ public class AzureManagementRequestException(
 
     private const string MethodNotAllowedInPricingTierErrorCode = "MethodNotAllowedInPricingTier";
 
+    private const string ValidationErrorCode = "ValidationError";
+
     public string ErrorCode { get; } = errorCode;
 
     public Uri RequestUri { get; } = requestUri;
@@ -62,6 +64,9 @@ public class AzureManagementRequestException(
 
     public bool IsMethodNotAllowedInPricingTierError =>
         ErrorCode.Equals(MethodNotAllowedInPricingTierErrorCode, StringComparison.OrdinalIgnoreCase);
+
+    public bool IsValidationError =>
+        ErrorCode.Equals(ValidationErrorCode, StringComparison.OrdinalIgnoreCase);
 }
 
 public static class HttpPipelineExtensions
@@ -294,9 +299,12 @@ public static class HttpPipelineExtensions
             {
                 return operationResponse;
             }
-            else
+
+            using (operationResponse)
             {
-                using (operationResponse)
+                var verifiedResponse = await pipeline.VerifyResource(operationResponse, cancellationToken);
+
+                using (verifiedResponse)
                 {
                     return Unit.Default;
                 }
@@ -379,6 +387,29 @@ public static class HttpPipelineExtensions
             if (updatedResponse.IsError)
             {
                 throw updatedResponse.ToHttpRequestException(locationUri);
+            }
+        }
+
+        return updatedResponse;
+    }
+
+    private static async ValueTask<Response> VerifyResource(this HttpPipeline pipeline, Response response, CancellationToken cancellationToken)
+    {
+        var updatedResponse = response;
+        if (updatedResponse.IsError) return updatedResponse;
+        if (updatedResponse.Headers.TryGetValue("Location", out var locationHeaderValue) &&
+            Uri.TryCreate(locationHeaderValue, UriKind.Absolute, out var locationUri))
+        {
+            using var request = pipeline.CreateRequest(locationUri, RequestMethod.Get);
+            updatedResponse = await pipeline.SendRequestAsync(request, cancellationToken);
+            if (updatedResponse.IsError)
+            {
+                throw updatedResponse.ToHttpRequestException(locationUri);
+            }
+
+            if (updatedResponse.Content is null || updatedResponse.Content.IsNull())
+            {
+                throw new ValueIsNullException($"The resource ({locationUri.AbsolutePath}) lacks a response body indicating it has failed to deploy.");
             }
         }
 

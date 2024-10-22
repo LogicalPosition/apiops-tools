@@ -170,7 +170,7 @@ internal static class ApiModule
                                               return Unit.Default;
                                           }))
                                 .WithCancellation(cancellationToken);
-        };
+        }
 
         async ValueTask putApiInner(ApiName name, CancellationToken cancellationToken)
         {
